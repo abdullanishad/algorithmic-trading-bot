@@ -1,0 +1,300 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+# package import statement
+from smartapi import SmartConnect
+import configparser
+from smartapi import SmartConnect
+import pandas as pd
+from datetime import datetime
+import requests
+import numpy as np
+import math
+from datetime import *
+import re
+from time import sleep
+from time import time as tim
+from bs4 import BeautifulSoup
+import threading
+from IPython.display import clear_output
+
+# create confiParser object for managing credentials
+config = configparser.ConfigParser()
+
+#read credentials for angel login
+config.read('credentials_angel.ini')
+
+#storing in credential in a variable
+client_id = config['angel']['client_id']
+password = config['angel']['password']
+api_key = config['angel']['api_key']
+
+
+# holidays
+def today_is_a_trading_holiday():
+    response = requests.get('https://zerodha.com/marketintel/holiday-calendar/')
+    soup = BeautifulSoup(response.text, 'html.parser')
+    soup = soup.find_all(name='h4')[0]
+    holiday = soup.find(string=re.compile("The next trading holiday"))
+    next_holiday = '-'.join(re.findall('([0-3][0-9]) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)',holiday)[0])
+    next_holiday = next_holiday+'-'+str(datetime.now().year)
+    next_holiday = datetime.strptime(next_holiday,'%d-%b-%Y').date()
+    return next_holiday == datetime.today().date()
+
+#place order
+def place_order(token,symbol,qty,exch_seg,buy_sell,ordertype,price):
+    try:
+        orderparams = {
+            "variety": "NORMAL",
+            "tradingsymbol": symbol,
+            "symboltoken": token,
+            "transactiontype": buy_sell,
+            "exchange": exch_seg,
+            "ordertype": ordertype,
+            "producttype": "INTRADAY",
+            "duration": "DAY",
+            "price": price,
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": qty
+            }
+        orderId=obj.placeOrder(orderparams)
+        print("The order id is: {}".format(orderId))
+        return orderId
+    except Exception as e:
+        print("Order placement failed: {}".format(e.message))
+        
+# fetch scrip json file and create data frame 
+def intializeSymbolTokenMap():
+    url = 'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json'
+    d = requests.get(url).json()
+    global token_df
+    token_df = 'test inside fun'
+    token_df = pd.DataFrame.from_dict(d)
+    token_df['expiry'] = pd.to_datetime(token_df['expiry'])
+    token_df = token_df.astype({'strike': float})
+
+# fetch token/instrument from dataframe
+def getTokenInfo (symbol,exch_seg='NSE',instrumenttype='OPTIDX',strike_price='',pe_ce='CE',expiry=None):
+    df = token_df
+    strike_price = strike_price*100
+    if exch_seg == 'NSE':
+        eq_df = df[(df['exch_seg'] == 'NSE') ]
+        return eq_df[eq_df['name'] == symbol]
+    elif exch_seg == 'NFO' and ((instrumenttype == 'FUTSTK') or (instrumenttype == 'FUTIDX')):
+        return df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'] == instrumenttype) & (df['name'] == symbol)].sort_values(by=['expiry'])
+    elif exch_seg == 'NFO' and (instrumenttype == 'OPTSTK' or instrumenttype == 'OPTIDX'):
+        return df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'] == instrumenttype) & (df['name'] == symbol) & (df['strike'] == strike_price) & (df['symbol'].str.endswith(pe_ce))].sort_values(by=['expiry'])
+
+def exit_all_position():
+    # close all open positions
+    open_positions = obj.position()
+    if open_positions['data'] != None:
+        for i in open_positions['data']:
+            if int(i['netqty']) != 0:
+                transaction_type = 'SELL' if int(i['netqty']) > 0 else 'BUY'
+                place_order(i['symboltoken'],i['tradingsymbol'],abs(int(i['netqty'])),i['exchange'],
+                            transaction_type,'MARKET',0)
+                sleep(0.2)
+                
+
+
+# In[2]:
+
+
+if __name__ == '__main__':
+    intializeSymbolTokenMap()
+    obj=SmartConnect(api_key=api_key)
+    data = obj.generateSession(client_id,password)
+    refreshToken= data['data']['refreshToken']
+    feedToken=obj.getfeedToken()
+    # credentials.FEED_TOKEN = feedToken
+    print(feedToken)
+    userProfile= obj.getProfile(refreshToken)
+    print(userProfile)
+
+
+# In[13]:
+
+
+def reentry(orderid,tradingsymbol,symboltoken,exchange,qty,stock_reentry):
+    orderbookid = list(filter(lambda orderbook: orderbook['orderid'] == orderid, obj.orderBook()['data']))
+    lastordertime_raw = orderbookid[0]['exchorderupdatetime']
+    lastordertime = datetime.strptime(lastordertime_raw, '%d-%b-%Y %H:%M:%S').strftime('%Y-%m-%d %H:%M')
+    current_time = datetime.now() - timedelta(minutes = 1)
+    current_time = current_time.strftime('%Y-%m-%d %H:%M')
+
+    latest_candle_close = 10000
+    prev_candle_open = 0
+    # first try without sleep
+    try:
+        # placed order 1m candle open 
+        try:
+            historicParam={
+            "exchange": 'NSE',
+            "symboltoken": symboltoken,
+            "interval": "ONE_MINUTE",
+            "fromdate": lastordertime, 
+            "todate": lastordertime
+            }
+            prev_candle_open = obj.getCandleData(historicParam)['data'][0][1]
+        except Exception as e:
+            print("Historic Api failed: {}".format(e.message))
+
+        # current 1m candle open 
+        try:
+            historicParam={
+            "exchange": 'NSE',
+            "symboltoken": symboltoken,
+            "interval": "ONE_MINUTE",
+            "fromdate": current_time, 
+            "todate": current_time
+            }
+            latest_candle_close = obj.getCandleData(historicParam)['data'][0][4]
+        except Exception as e:
+            print("Historic Api failed: {}".format(e.message))
+            
+    except Exception as e:
+        # second try with sleep 1 sec against access rate limit
+        try:
+            try:
+                historicParam={
+                "exchange": 'NSE',
+                "symboltoken": symboltoken,
+                "interval": "ONE_MINUTE",
+                "fromdate": lastordertime, 
+                "todate": lastordertime
+                }
+                prev_candle_open = obj.getCandleData(historicParam)['data'][0][1]
+            except Exception as e:
+                print("Historic Api failed: {}".format(e.message))
+            
+            sleep(1)
+
+            # current 1m candle open 
+            try:
+                historicParam={
+                "exchange": 'NSE',
+                "symboltoken": symboltoken,
+                "interval": "ONE_MINUTE",
+                "fromdate": current_time, 
+                "todate": current_time
+                }
+                latest_candle_close = obj.getCandleData(historicParam)['data'][0][4]
+            except Exception as e:
+                print("Historic Api failed: {}".format(e.message))
+
+        except Exception as e:
+            print("position digger failed: {}".format(e))
+
+    updated_order_id = orderid
+    if latest_candle_close < prev_candle_open:
+        updated_order_id = place_order(symboltoken,tradingsymbol,qty, exchange,'SELL','MARKET',0)
+        stock_reentry -= 1
+        print(f'available reentry : {stock_reentry}')
+
+    return updated_order_id, stock_reentry
+
+
+# In[14]:
+
+
+def position_digger(token_1,token_2):
+    global pos_qty_1,pos_qty_2,mtm
+    pos_qty_1,pos_qty_2,mtm = None, None, 0
+    try:
+        start = datetime.now()
+        for item in obj.position()['data']:
+            mtm += round(float(item['pnl']),2)
+            if item['symboltoken'] == token_1:
+                pos_qty_1 = int(item['netqty'])
+            if item['symboltoken'] == token_2:
+                pos_qty_2 = int(item['netqty'])
+        end = datetime.now()
+        clear_output(wait=True)
+        print(f'position 1: {pos_qty_1} qty....position 2: {pos_qty_2} qty...... p&l : {mtm}')
+    except Exception as e:
+        try:
+            start = datetime.now()
+            for item in obj.position()['data']:
+                mtm += round(float(item['pnl']),2)
+                if item['symboltoken'] == token_1:
+                    pos_qty_1 = int(item['netqty'])
+                if item['symboltoken'] == token_2:
+                    pos_qty_2 = int(item['netqty'])
+                sleep(1)
+            end = datetime.now()
+            clear_output(wait=True)
+            print(f'position 1: {pos_qty_1} qty....position 2: {pos_qty_2} qty...... p&l : {mtm}')
+        except Exception as e:
+            try:
+                start = datetime.now()
+                for item in obj.position()['data']:
+                    mtm += round(float(item['pnl']),2)
+                    if item['symboltoken'] == token_1:
+                        pos_qty_1 = int(item['netqty'])
+                    if item['symboltoken'] == token_2:
+                        pos_qty_2 = int(item['netqty'])
+                    sleep(2)
+                end = datetime.now()
+                clear_output(wait=True)
+                print(f'position 1: {pos_qty_1} qty....position 2: {pos_qty_2} qty...... p&l : {mtm}')
+            except Exception as e:
+                print("position digger failed: {}".format(e))
+
+
+# In[15]:
+
+
+# body of program to run
+weekday_today = datetime.now().weekday()
+if (weekday_today != 5) & (weekday_today != 6):
+    if today_is_a_trading_holiday() == False:
+        
+        # wait till 9:20 am
+        while datetime.now().time() < time(10,1,0):
+            sleep(1)
+            
+        # initial order (test)
+        stock_1 = getTokenInfo('NMDC').iloc[1]
+        symbol_1  = stock_1['symbol']
+        token_1 = stock_1['token']
+        qty_1 = int(stock_1['lotsize'])
+        exch_1 = stock_1['exch_seg']
+        orderid_1 = place_order(token_1,symbol_1,qty_1,'NSE','SELL','MARKET',0)
+        stock_1_reentry = 2
+        
+        # initial order (test)
+        stock_2 = getTokenInfo('TATASTEEL').iloc[0]
+        symbol_2  = stock_2['symbol']
+        token_2 = stock_2['token']
+        qty_2 = int(stock_2['lotsize'])
+        exch_2 = stock_2['exch_seg']
+        orderid_2 = place_order(token_2,symbol_2,qty_2,'NSE','SELL','MARKET',0)
+        stock_2_reentry = 2
+        
+        max_mtm = 100
+
+        # after initial entry
+        while datetime.now().time() < time(14,30,58):
+            position_digger(token_1,token_2)
+            if mtm >= max_mtm:
+                break
+
+            if pos_qty_1 == 0 and stock_1_reentry > 0:
+                orderid_1, stock_1_reentry = reentry(orderid_1,symbol_1,token_1,exch_1,qty_1,stock_1_reentry)
+
+            if pos_qty_2 == 0 and stock_2_reentry > 0:
+                orderid_2, stock_2_reentry = reentry(orderid_2,symbol_2,token_2,exch_2,qty_2,stock_2_reentry)
+            
+        exit_all_position()
+
